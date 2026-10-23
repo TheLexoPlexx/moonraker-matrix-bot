@@ -4,9 +4,7 @@ import gc
 import logging
 
 from apscheduler.schedulers.base import BaseScheduler  # type: ignore
-from telegram import Bot, Message
-from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from chat_transport import ChatTransport, OutgoingMessage
 
 from camera import Camera
 from configuration import ConfigWrapper
@@ -31,7 +29,7 @@ class Timelapse:
         klippy: Klippy,
         camera: Camera,
         scheduler: BaseScheduler,
-        bot: Bot,
+        transport: ChatTransport,
         logging_handler: logging.Handler,
     ):
         self._enabled: bool = config.timelapse.enabled and camera.enabled
@@ -62,8 +60,7 @@ class Timelapse:
         self._camera.last_frame_duration = self._last_frame_duration
 
         self._sched: BaseScheduler = scheduler
-        self._chat_id: int = config.secrets.chat_id
-        self._bot: Bot = bot
+        self._transport: ChatTransport = transport
 
         self._running: bool = False
         self._paused: bool = False
@@ -238,7 +235,7 @@ class Timelapse:
                 replace_existing=True,
             )
 
-    async def upload_timelapse(self, lapse_filename: str, info_mess, gcode_name_out: str = None) -> None:
+    async def upload_timelapse(self, lapse_filename: str, info_mess: OutgoingMessage, gcode_name_out: str = None) -> None:
         try:
             (
                 video_bytes,
@@ -253,24 +250,23 @@ class Timelapse:
                 await info_mess.edit_text(text="Uploading time-lapse")
 
                 if len(video_bytes) > self._max_upload_file_size * 1024 * 1024:
-                    await info_mess.edit_text(text=f"Telegram bots have a {self._max_upload_file_size}mb filesize restriction, please retrieve the timelapse from the configured folder\n{video_path}")
+                    await info_mess.edit_text(text=f"Video exceeds {self._max_upload_file_size}mb upload limit, retrieve timelapse from the configured folder\n{video_path}")
                 else:
                     lapse_caption = f"time-lapse of {gcode_name}"
                     if self._camera.lapse_missed_frames > 0:
                         lapse_caption += f"\n{self._camera.lapse_missed_frames} frames missed"
-                    await self._bot.send_video(
-                        self._chat_id,
-                        video=video_bytes,
-                        thumbnail=thumb_bytes,
-                        width=width,
-                        height=height,
-                        caption=lapse_caption,
+                    await self._transport.send_video_message(
+                        video_bytes,
+                        thumb_bytes,
+                        width,
+                        height,
+                        lapse_caption,
+                        self._silent_progress,
                         write_timeout=600,
-                        disable_notification=self._silent_progress,
                     )
                     try:
-                        await self._bot.delete_message(self._chat_id, message_id=info_mess.message_id)
-                    except BadRequest as badreq:
+                        await info_mess.delete()
+                    except Exception as badreq:
                         logger.warning("Failed deleting message \n%s", badreq)
                     self._camera.cleanup(lapse_filename)
             else:
@@ -289,8 +285,8 @@ class Timelapse:
                 await self._klippy.save_data_to_marco(video_bio_nbytes, video_path, f"{gcode_name}.mp4")
                 await self._klippy.execute_gcode_script(self._after_lapse_gcode.strip())
         except Exception as ex:
-            logger.warning("Failed to send time-lapse to telegram bot: %s", ex)
-            await info_mess.edit_text(text=f"Failed to send time-lapse to telegram bot: {str(ex)}")
+            logger.warning("Failed to send time-lapse: %s", ex)
+            await info_mess.edit_text(text=f"Failed to send time-lapse: {str(ex)}")
 
     async def _send_lapse(self) -> None:
         if not self._enabled or not self._klippy.printing_filename:
@@ -300,10 +296,9 @@ class Timelapse:
         lapse_filename = self._klippy.printing_filename_with_time
         gcode_name = self._klippy.printing_filename
 
-        info_mess: Message = await self._bot.send_message(
-            chat_id=self._chat_id,
-            text=f"Starting time-lapse assembly for {gcode_name}",
-            disable_notification=self._silent_progress,
+        info_mess: OutgoingMessage = await self._transport.send_text_message(
+            f"Starting time-lapse assembly for {gcode_name}",
+            self._silent_progress,
         )
 
         if self._executors_pool._work_queue.qsize() > 0:  # pylint: disable=protected-access
@@ -313,7 +308,7 @@ class Timelapse:
         while self._executors_pool._work_queue.qsize() > 0:  # pylint: disable=protected-access
             await asyncio.sleep(1)
 
-        await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.RECORD_VIDEO)
+        await self._transport.send_record_video()
 
         await self.upload_timelapse(lapse_filename, info_mess, gcode_name)
         info_mess = None  # type: ignore

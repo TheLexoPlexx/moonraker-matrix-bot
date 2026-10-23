@@ -151,9 +151,10 @@ class SecretsConfig(ConfigHelper):
         "user",
         "password",
         "api_token",
+        "matrix_token",
     ]
 
-    def __init__(self, config: configparser.ConfigParser):
+    def __init__(self, config: configparser.ConfigParser, platform: str = "telegram"):
         secrets_path = Path(os.path.expanduser(config.get("secrets", "secrets_path", fallback="")))
         secrets_path_default_name = Path(os.path.expanduser(config.get("secrets", "secrets_path", fallback="") + "/secrets.conf"))
         conf = configparser.ConfigParser(allow_no_value=True, inline_comment_prefixes=(";", "#"))
@@ -167,14 +168,17 @@ class SecretsConfig(ConfigHelper):
             self._section = "bot"
             super().__init__(config)
 
-        if not self._config.has_option(self._section, "bot_token"):
-            self._parsing_errors.append("Option 'bot_token': value is not provided")
-
         self.token: str = self._get_str("bot_token", default="")
         self.chat_id: int = self._get_int("chat_id", default=0)
         self.user: str = self._get_str("user", default="")
         self.passwd: str = self._get_str("password", default="")
         self.api_token: str = self._get_str("api_token", default="")
+        self.matrix_token: str = self._get_str("matrix_token", default="")
+
+        if platform == "telegram" and not self.token:
+            self._parsing_errors.append("Option 'bot_token': value is not provided")
+        if platform == "matrix" and not self.matrix_token:
+            self._parsing_errors.append("Option 'matrix_token': value is not provided")
 
 
 class BotConfig(ConfigHelper):
@@ -185,6 +189,11 @@ class BotConfig(ConfigHelper):
         "user",
         "password",
         "api_token",
+        "matrix_token",
+        "platform",
+        "homeserver",
+        "matrix_user",
+        "matrix_room",
         "server",
         "port",
         "ssl",
@@ -199,8 +208,12 @@ class BotConfig(ConfigHelper):
         "services",
     ]
 
-    def __init__(self, config: configparser.ConfigParser):
+    def __init__(self, config: configparser.ConfigParser, platform: str = "telegram"):
         super().__init__(config)
+
+        self.platform: str = self._get_str("platform", default="telegram", allowed_values=["telegram", "matrix"])
+        if platform != self.platform:
+            platform = self.platform
 
         # Todo: validate server addr have ho port or protocol!
         self.host: str = self._get_str("server", default="localhost")
@@ -208,7 +221,13 @@ class BotConfig(ConfigHelper):
         self.ssl_verify: bool = self._get_boolean("ssl_verify", default=True)
         self.port: int = self._get_int("port", default=80)
         self.api_url: str = self._get_str("api_url", default="https://api.telegram.org/bot")
-        self.max_upload_file_size: int = 50 if self.api_url == "https://api.telegram.org/bot" else 2000
+        if self.platform == "matrix":
+            self.max_upload_file_size: int = 100
+        else:
+            self.max_upload_file_size = 50 if self.api_url == "https://api.telegram.org/bot" else 2000
+        self.homeserver: str = self._get_str("homeserver", default="")
+        self.matrix_user: str = self._get_str("matrix_user", default="")
+        self.matrix_room: str = self._get_str("matrix_room", default="")
         self.socks_proxy: str = self._get_str("socks_proxy", default="")
         self.light_device_name: str = self._get_str("light_device", default="")
         self.poweroff_device_name: str = self._get_str("power_device", default="")
@@ -225,6 +244,14 @@ class BotConfig(ConfigHelper):
             self.port = int(host_parts[1])
         elif len(host_parts) >= 2:
             self._parsing_errors.append("Protocol must be specified in other configuration parameters")
+
+        if self.platform == "matrix":
+            if not self.homeserver:
+                self._parsing_errors.append("Option 'homeserver': value is not provided")
+            if not self.matrix_user:
+                self._parsing_errors.append("Option 'matrix_user': value is not provided")
+            if not self.matrix_room:
+                self._parsing_errors.append("Option 'matrix_room': value is not provided")
 
     @property
     def formatted_upload_path(self):
@@ -476,8 +503,11 @@ class ConfigWrapper:
                 config.read(pathlib.PurePath(path).parent.joinpath(addit_conf))
 
         self._config = config
-        self.secrets = SecretsConfig(config)
-        self.bot_config = BotConfig(config)
+        platform = config.get("bot", "platform", fallback="telegram").strip().lower()
+        if platform not in ("telegram", "matrix"):
+            platform = "telegram"
+        self.secrets = SecretsConfig(config, platform)
+        self.bot_config = BotConfig(config, platform)
         self.camera = CameraConfig(config)
         self.notifications = NotifierConfig(config)
         self.timelapse = TimelapseConfig(config)
@@ -507,6 +537,10 @@ class ConfigWrapper:
             log_file.write("Current Moonraker telegram bot config\n")
             self._config.remove_option("bot", "bot_token")
             self._config.remove_option("bot", "chat_id")
+            if self._config.has_option("bot", "matrix_token"):
+                self._config.remove_option("bot", "matrix_token")
+            if self._config.has_section("secrets") and self._config.has_option("secrets", "matrix_token"):
+                self._config.remove_option("secrets", "matrix_token")
             for sec in self._config.sections():
                 if sec.startswith("include"):
                     self._config.remove_section(sec)

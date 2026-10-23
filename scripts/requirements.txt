@@ -11,6 +11,7 @@ orjson==3.10.15
 Pillow==11.1.0 ; python_version>='3.10'
 Pillow==10.4.0 ; python_version<='3.9'
 python-telegram-bot[socks,http2,rate-limiter,callback-data,job-queue]==21.10
+matrix-nio==0.25.2
 tzlocal==5.2
 uvloop==0.21.0 ; platform_system != "Windows"
 websockets==14.1

@@ -22,7 +22,7 @@ import httpx
 from httpx import HTTPError
 import numpy
 from numpy import ndarray
-from telegram import Message
+from chat_transport import OutgoingMessage
 
 from configuration import ConfigWrapper
 from klippy import Klippy, PowerDevice
@@ -464,7 +464,7 @@ class Camera:
         raw_frame_rgb = None
         del raw_frame, raw_frame_rgb
 
-    async def create_timelapse(self, printing_filename: str, gcode_name: str, info_mess: Message) -> Tuple[bytes, bytes, int, int, str, str]:
+    async def create_timelapse(self, printing_filename: str, gcode_name: str, info_mess: OutgoingMessage) -> Tuple[bytes, bytes, int, int, str, str]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, functools.partial(self._create_timelapse, printing_filename, gcode_name, info_mess, loop))
 
@@ -490,7 +490,7 @@ class Camera:
     def _get_frame(self, path: str):
         return numpy.load(path, allow_pickle=True)["raw"]
 
-    def _create_timelapse(self, printing_filename: str, gcode_name: str, info_mess: Message, loop) -> Tuple[bytes, bytes, int, int, str, str]:
+    def _create_timelapse(self, printing_filename: str, gcode_name: str, info_mess: OutgoingMessage, loop) -> Tuple[bytes, bytes, int, int, str, str]:
         if not printing_filename:
             raise ValueError("Gcode file name is empty")
 

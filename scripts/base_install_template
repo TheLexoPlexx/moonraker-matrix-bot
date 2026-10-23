@@ -2,8 +2,14 @@
 
 [bot]
 server: localhost
+platform: telegram
 bot_token: AweSomeBotToken
 chat_id: 0
+#platform: matrix
+#homeserver: https://matrix.example.org
+#matrix_user: @bot:example.org
+#matrix_room: !roomid:example.org
+#matrix_token: syt_...
 
 [camera]
 host: http://localhost:8080/?action=stream

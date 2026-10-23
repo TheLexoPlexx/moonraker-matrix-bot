@@ -33,6 +33,8 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackContext, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from camera import Camera, FFmpegCamera, MjpegCamera
+from chat_transport import ChatTransport, create_chat_transport, create_matrix_client
+from command_session import CommandSession, MatrixCommandSession, TelegramCommandSession
 from configuration import ConfigWrapper
 from klippy import Klippy, PowerDevice
 from notifications import Notifier
@@ -52,7 +54,9 @@ class SensitiveFormatter(logging.Formatter):
 
     @staticmethod
     def _filter(s):
-        return re.sub(r"\d{10}:[0-9A-Za-z_-]{35}", "**************", s)
+        s = re.sub(r"\d{10}:[0-9A-Za-z_-]{35}", "**************", s)
+        s = re.sub(r"syt_[A-Za-z0-9_-]+", "**************", s)
+        return s
 
     def format(self, record):
         original = logging.Formatter.format(self, record)
@@ -116,10 +120,12 @@ main_pid = os.getpid()
 cameraWrap: Camera
 timelapse: Timelapse
 notifier: Notifier
+chat_transport: ChatTransport
 klippy: Klippy
 light_power_device: PowerDevice
 psu_power_device: PowerDevice
 ws_helper: WebSocketHelper
+rotating_handler: logging.Handler
 executors_pool: ThreadPoolExecutor = ThreadPoolExecutor(2, thread_name_prefix="bot_pool")
 
 
@@ -146,32 +152,22 @@ async def unknown_chat(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unauthorized access detected from `%s` with chat_id `%s`. Message: %s", update.effective_chat.username, update.effective_chat.id, update.effective_message.to_json())
 
 
-async def status_no_confirm(effective_message: Message) -> None:
+async def status_no_confirm(session: CommandSession) -> None:
     if klippy.printing and not configWrap.notifications.group_only:
         notifier.update_status()
         time.sleep(configWrap.camera.light_timeout + 1.5)
-        await effective_message.delete()
+        await session.delete()
     else:
         mess = await klippy.get_status()
         if cameraWrap.enabled:
             loop_loc = asyncio.get_running_loop()
             with await loop_loc.run_in_executor(executors_pool, cameraWrap.take_photo) as bio:
-                await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.UPLOAD_PHOTO)
-                await effective_message.reply_photo(
-                    photo=bio,
-                    caption=mess,
-                    parse_mode=ParseMode.HTML,
-                    disable_notification=notifier.silent_commands,
-                )
+                await session.send_chat_action_upload_photo()
+                await session.reply_photo(bio, mess, silent=notifier.silent_commands)
                 bio.close()
         else:
-            await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.TYPING)
-            await effective_message.reply_text(
-                mess,
-                parse_mode=ParseMode.HTML,
-                disable_notification=notifier.silent_commands,
-                quote=True,
-            )
+            await session.send_chat_action_typing()
+            await session.reply_text(mess, silent=notifier.silent_commands)
 
 
 async def status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -182,7 +178,7 @@ async def status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("status") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Update status?", callback_mess="status:")
     else:
-        await status_no_confirm(update.effective_message)
+        await status_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 async def check_unfinished_lapses(bot: telegram.Bot):
@@ -225,8 +221,8 @@ async def check_unfinished_lapses(bot: telegram.Bot):
     )
 
 
-async def get_ip_no_confirm(effective_message: Message) -> None:
-    await effective_message.reply_text(get_local_ip(), quote=True)
+async def get_ip_no_confirm(session: CommandSession) -> None:
+    await session.reply_text(get_local_ip())
 
 
 async def get_ip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -237,38 +233,25 @@ async def get_ip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("ip") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Show ip?", callback_mess="ip:")
     else:
-        await get_ip_no_confirm(update.effective_message)
+        await get_ip_no_confirm(TelegramCommandSession(update.effective_message))
 
 
-async def get_video_no_confirm(effective_message: Message) -> None:
+async def get_video_no_confirm(session: CommandSession) -> None:
     if not cameraWrap.enabled:
-        await effective_message.reply_text("camera is disabled", quote=True)
+        await session.reply_text("camera is disabled")
     else:
-        info_reply: Message = await effective_message.reply_text(
-            text="Starting video recording",
-            disable_notification=notifier.silent_commands,
-            quote=True,
-        )
-        await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.RECORD_VIDEO)
+        info_reply = await session.reply_text("Starting video recording", silent=notifier.silent_commands)
+        await session.send_chat_action_record_video()
 
         loop_loc = asyncio.get_running_loop()
         (video_bio, thumb_bio, width, height) = await loop_loc.run_in_executor(executors_pool, cameraWrap.take_video)
-        await info_reply.edit_text(text="Uploading video")
+        await info_reply.edit_text("Uploading video")
         max_upload_file_size: int = configWrap.bot_config.max_upload_file_size
         if video_bio.getbuffer().nbytes > max_upload_file_size * 1024 * 1024:
-            await info_reply.edit_text(text=f"Telegram has a {max_upload_file_size}mb restriction...")
+            await info_reply.edit_text(f"Upload limit is {max_upload_file_size}mb")
         else:
-            await effective_message.reply_video(
-                video=video_bio,
-                thumbnail=thumb_bio,
-                width=width,
-                height=height,
-                caption="",
-                write_timeout=120,
-                disable_notification=notifier.silent_commands,
-                quote=True,
-            )
-            await effective_message.get_bot().delete_message(chat_id=configWrap.secrets.chat_id, message_id=info_reply.message_id)
+            await session.reply_video(video_bio, thumb_bio, width, height, "", silent=notifier.silent_commands)
+            await info_reply.delete()
 
         video_bio.close()
         thumb_bio.close()
@@ -282,7 +265,7 @@ async def get_video(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("video") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Get video?", callback_mess="video:")
     else:
-        await get_video_no_confirm(update.effective_message)
+        await get_video_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 def confirm_keyboard(callback_mess: str) -> InlineKeyboardMarkup:
@@ -329,12 +312,12 @@ async def command_confirm_message_ext(update: Update, command: str, confirm_text
             quote=True,
         )
     else:
-        await command_exec(effective_message=update.effective_message, exec_text=exec_text, exec_func=exec_func)
+        await command_exec(TelegramCommandSession(update.effective_message), exec_text=exec_text, exec_func=exec_func)
 
 
-async def command_exec(effective_message: Message, exec_text: str, exec_func: Coroutine[Any, Any, None]):
+async def command_exec(session: CommandSession, exec_text: str, exec_func: Coroutine[Any, Any, None]):
     if exec_text is not None:
-        await effective_message.reply_text(exec_text, quote=True)
+        await session.reply_text(exec_text)
     await exec_func
 
 
@@ -437,16 +420,8 @@ def prepare_log_files() -> tuple[List[str], bool, Optional[str]]:
     return ["telegram.log", "crowsnest.log", "moonraker.log", "klippy.log", "KlipperScreen.log", "dmesg.txt", "debug.txt"], dmesg_success, dmesg_error
 
 
-async def send_logs_no_confirm(effective_message: Message) -> None:
-    if effective_message is None or effective_message.get_bot() is None:
-        logger.warning("Undefined effective message or bot")
-        return
-
-    resp_message = await effective_message.reply_text(
-        "Collecting logs",
-        disable_notification=notifier.silent_commands,
-        quote=True,
-    )
+async def send_logs_no_confirm(session: CommandSession) -> None:
+    resp_message = await session.reply_text("Collecting logs", silent=notifier.silent_commands)
 
     logs_list: List[Union[InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo]] = []
     for log_file in prepare_log_files()[0]:
@@ -459,11 +434,11 @@ async def send_logs_no_confirm(effective_message: Message) -> None:
 
     if logs_list:
         await resp_message.edit_text("Uploading logs")
-        await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-        await effective_message.reply_media_group(logs_list, disable_notification=notifier.silent_commands, quote=True, write_timeout=120)
-        await resp_message.edit_text(text=f"{await klippy.get_versions_info()}\nUpload logs to analyzer /logs_upload")
+        await session.send_chat_action_upload_document()
+        await session.reply_media_group(logs_list, silent=notifier.silent_commands, write_timeout=120)
+        await resp_message.edit_text(f"{await klippy.get_versions_info()}\nUpload logs to analyzer /logs_upload")
     else:
-        await resp_message.edit_text(text=f"No logs found in log_path `{configWrap.bot_config.log_path}`")
+        await resp_message.edit_text(f"No logs found in log_path `{configWrap.bot_config.log_path}`")
 
 
 async def send_logs(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -474,15 +449,11 @@ async def send_logs(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("logs") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Send logs to chat?", callback_mess="send_logs:")
     else:
-        await send_logs_no_confirm(update.effective_message)
+        await send_logs_no_confirm(TelegramCommandSession(update.effective_message))
 
 
-async def upload_logs_no_confirm(effective_message: Message) -> None:
-    resp_message = await effective_message.reply_text(
-        "Collecting logs",
-        disable_notification=notifier.silent_commands,
-        quote=True,
-    )
+async def upload_logs_no_confirm(session: CommandSession) -> None:
+    resp_message = await session.reply_text("Collecting logs", silent=notifier.silent_commands)
 
     files_list, dmesg_success, dmesg_error = prepare_log_files()
     if not dmesg_success:
@@ -498,7 +469,7 @@ async def upload_logs_no_confirm(effective_message: Message) -> None:
                 tar.add(Path(f"{configWrap.bot_config.log_path}/{file}"), arcname=file)
 
     await resp_message.edit_text("Uploading logs to parser")
-    await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+    await session.send_chat_action_upload_document()
 
     with open(f"{configWrap.bot_config.log_path}/logs.tar.xz", "rb") as log_archive_ojb:
         resp = httpx.post(url="https://coderus.openrepos.net/klipper_logs", files={"tarfile": log_archive_ojb}, follow_redirects=False, timeout=25)
@@ -519,7 +490,7 @@ async def upload_logs(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("logs_upload") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Upload logs?", callback_mess="logs_upload:")
     else:
-        await upload_logs_no_confirm(update.effective_message)
+        await upload_logs_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 async def restart_bot() -> None:
@@ -529,21 +500,27 @@ async def restart_bot() -> None:
     os.kill(main_pid, signal.SIGTERM)
 
 
-async def power_toggle_no_confirm(effective_message: Message) -> None:
-    await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.TYPING)
-    if psu_power_device:
-        await effective_message.reply_text(
-            "Power " + "Off" if psu_power_device.device_state else "On" + " printer?",
-            reply_markup=confirm_keyboard("power_off_printer" if psu_power_device.device_state else "power_on_printer"),
-            disable_notification=notifier.silent_commands,
-            quote=True,
-        )
-    else:
-        await effective_message.reply_text(
+async def power_toggle_no_confirm(session: CommandSession) -> None:
+    if not psu_power_device:
+        await session.reply_text(
             "No device defined for /power command in bot config.\nPlease add a moonraker power device to the bot's config",
-            disable_notification=notifier.silent_commands,
-            quote=True,
+            silent=notifier.silent_commands,
         )
+        return
+    if configWrap.bot_config.platform == "matrix":
+        new_state = not psu_power_device.device_state
+        await psu_power_device.switch_device(new_state)
+        if psu_power_device.device_error:
+            await session.reply_text(f"Device `{psu_power_device.name}` failed to toggle\nError: {psu_power_device.device_error}", silent=notifier.silent_commands)
+        else:
+            await session.reply_text(f"Device `{psu_power_device.name}` toggled {'on' if new_state else 'off'}", silent=notifier.silent_commands)
+        return
+    await session.send_chat_action_typing()
+    await session.reply_text(
+        "Power " + ("Off" if psu_power_device.device_state else "On") + " printer?",
+        reply_markup=confirm_keyboard("power_off_printer" if psu_power_device.device_state else "power_on_printer"),
+        silent=notifier.silent_commands,
+    )
 
 
 async def power_toggle(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -554,26 +531,17 @@ async def power_toggle(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("power") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Toggle power device?", callback_mess="power_toggle:")
     else:
-        await power_toggle_no_confirm(update.effective_message)
+        await power_toggle_no_confirm(TelegramCommandSession(update.effective_message))
 
 
-async def light_toggle_no_confirm(effective_message: Message) -> None:
+async def light_toggle_no_confirm(session: CommandSession) -> None:
     if light_power_device:
         mess = f"Device `{light_power_device.name}` toggled " + ("on" if await light_power_device.toggle_device() else "off")
         if light_power_device.device_error:
             mess += "\nError: `" + light_power_device.device_error + "`"
-        await effective_message.reply_text(
-            mess,
-            parse_mode=ParseMode.HTML,
-            disable_notification=notifier.silent_commands,
-            quote=True,
-        )
+        await session.reply_text(mess, silent=notifier.silent_commands)
     else:
-        await effective_message.reply_text(
-            "No light device in config!",
-            disable_notification=notifier.silent_commands,
-            quote=True,
-        )
+        await session.reply_text("No light device in config!", silent=notifier.silent_commands)
 
 
 async def light_toggle(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -584,7 +552,7 @@ async def light_toggle(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("light") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Toggle light device?", callback_mess="light_toggle:")
     else:
-        await light_toggle_no_confirm(update.effective_message)
+        await light_toggle_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 async def button_lapse_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -606,12 +574,8 @@ async def button_lapse_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     )[0].text
 
-    info_mess: Message = await context.bot.send_message(
-        chat_id=configWrap.secrets.chat_id,
-        text=f"Starting time-lapse assembly for {lapse_name}",
-        disable_notification=notifier.silent_commands,
-    )
-    await context.bot.send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.RECORD_VIDEO)
+    info_mess = await chat_transport.send_text_message(f"Starting time-lapse assembly for {lapse_name}", notifier.silent_commands)
+    await chat_transport.send_record_video()
     await timelapse.upload_timelapse(lapse_name, info_mess)
     info_mess = None  # type: ignore
     await query.delete_message()
@@ -698,24 +662,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif update.effective_message.reply_to_message is None:
         logger.error("Undefined reply_to_message for %s", update.effective_message.to_json())
     elif query.data == "emergency_stop":
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Executing emergency stop", exec_func=ws_helper.emergency_stop_printer())
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Executing emergency stop", exec_func=ws_helper.emergency_stop_printer())
     elif query.data == "firmware_restart":
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Restarting klipper firmware", exec_func=ws_helper.firmware_restart_printer())
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Restarting klipper firmware", exec_func=ws_helper.firmware_restart_printer())
     elif query.data == "cancel_printing":
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Canceling printing", exec_func=ws_helper.manage_printing("cancel"))
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Canceling printing", exec_func=ws_helper.manage_printing("cancel"))
     elif query.data == "pause_printing":
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Pausing printing", exec_func=ws_helper.manage_printing("pause"))
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Pausing printing", exec_func=ws_helper.manage_printing("pause"))
     elif query.data == "resume_printing":
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Resuming printing", exec_func=ws_helper.manage_printing("resume"))
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Resuming printing", exec_func=ws_helper.manage_printing("resume"))
     elif query.data == "shutdown_host":
         await query.delete_message()
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Shutting down host", exec_func=ws_helper.shutdown_pi_host())
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Shutting down host", exec_func=ws_helper.shutdown_pi_host())
     elif query.data == "reboot_host":
         await query.delete_message()
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Rebooting host", exec_func=ws_helper.reboot_pi_host())
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Rebooting host", exec_func=ws_helper.reboot_pi_host())
     elif query.data == "bot_restart":
         await query.delete_message()
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text="Restarting bot", exec_func=restart_bot())
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text="Restarting bot", exec_func=restart_bot())
     elif query.data == "power_off_printer":
         await psu_power_device.switch_device(False)
         if psu_power_device.device_error:
@@ -740,7 +704,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     elif "macro:" in query.data:
         command = query.data.replace("macro:", "")
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text=f"Running macro: {command}", exec_func=ws_helper.execute_ws_gcode_script(command))
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text=f"Running macro: {command}", exec_func=ws_helper.execute_ws_gcode_script(command))
     elif "macroc:" in query.data:
         command = query.data.replace("macroc:", "")
         await query.edit_message_text(
@@ -777,27 +741,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         delete_query = False
     elif "rstrt_srv:" in query.data:
         service_name = query.data.replace("rstrt_srv:", "")
-        await command_exec(effective_message=update.effective_message.reply_to_message, exec_text=f"Restarting service: {service_name}", exec_func=ws_helper.restart_system_service(service_name))
+        await command_exec(TelegramCommandSession(update.effective_message.reply_to_message), exec_text=f"Restarting service: {service_name}", exec_func=ws_helper.restart_system_service(service_name))
     elif "logs_upload:" in query.data:
-        await upload_logs_no_confirm(update.effective_message.reply_to_message)
+        await upload_logs_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "send_logs:" in query.data:
-        await send_logs_no_confirm(update.effective_message.reply_to_message)
+        await send_logs_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "files:" in query.data:
-        await get_gcode_files_no_confirm(update.effective_message.reply_to_message)
+        await get_gcode_files_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "services:" in query.data:
-        await services_keyboard_no_confirm(update.effective_message.reply_to_message)
+        await services_keyboard_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "macros:" in query.data:
-        await get_macros_no_confirm(update.effective_message.reply_to_message)
+        await get_macros_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "help:" in query.data:
-        await help_command_no_confirm(update.effective_message.reply_to_message)
+        await help_command_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "status:" in query.data:
-        await status_no_confirm(update.effective_message.reply_to_message)
+        await status_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "ip:" in query.data:
-        await get_ip_no_confirm(update.effective_message.reply_to_message)
+        await get_ip_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "power_toggle:" in query.data:
-        await power_toggle_no_confirm(update.effective_message.reply_to_message)
+        await power_toggle_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     elif "light_toggle:" in query.data:
-        await light_toggle_no_confirm(update.effective_message.reply_to_message)
+        await light_toggle_no_confirm(TelegramCommandSession(update.effective_message.reply_to_message))
     else:
         logger.debug("unknown message from inline keyboard query: %s", query.data)
 
@@ -805,14 +769,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.delete_message()
 
 
-async def get_gcode_files_no_confirm(effective_message: Message) -> None:
-    await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.TYPING)
-    await effective_message.reply_text(
-        "Gcode files to print:",
-        reply_markup=await gcode_files_keyboard(),
-        disable_notification=notifier.silent_commands,
-        quote=True,
-    )
+async def get_gcode_files_no_confirm(session: CommandSession) -> None:
+    await session.send_chat_action_typing()
+    if configWrap.bot_config.platform == "matrix":
+        gcodes = await klippy.get_gcode_files()
+        lines = [el["path"] if "path" in el else el["filename"] for el in gcodes[:100]]
+        await session.reply_text("Gcode files (use /files <path> to print):\n" + "\n".join(lines), silent=notifier.silent_commands)
+    else:
+        await session.reply_text("Gcode files to print:", reply_markup=await gcode_files_keyboard(), silent=notifier.silent_commands)
 
 
 async def get_gcode_files(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -823,7 +787,7 @@ async def get_gcode_files(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("files") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="List gcode files?", callback_mess="files:")
     else:
-        await get_gcode_files_no_confirm(update.effective_message)
+        await get_gcode_files_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 async def gcode_files_keyboard(offset: int = 0):
@@ -866,25 +830,23 @@ async def gcode_files_keyboard(offset: int = 0):
     return InlineKeyboardMarkup(files_keys)
 
 
-async def services_keyboard_no_confirm(effective_message: Message) -> None:
-    def create_service_button(element) -> List[InlineKeyboardButton]:
-        return [
-            InlineKeyboardButton(
-                element,
-                callback_data=f"rstrt_srvc:{element}" if configWrap.telegram_ui.is_present_in_require_confirmation("services") else f"rstrt_srv:{element}",
-            )
-        ]
-
+async def services_keyboard_no_confirm(session: CommandSession) -> None:
     services = configWrap.bot_config.services
-    service_keys: List[List[InlineKeyboardButton]] = list(map(create_service_button, services))
+    await session.send_chat_action_typing()
+    if configWrap.bot_config.platform == "matrix":
+        await session.reply_text("Services (use /services <name> to restart):\n" + "\n".join(services), silent=notifier.silent_commands)
+    else:
 
-    await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.TYPING)
-    await effective_message.reply_text(
-        "Services to operate:",
-        reply_markup=InlineKeyboardMarkup(service_keys),
-        disable_notification=notifier.silent_commands,
-        quote=True,
-    )
+        def create_service_button(element) -> List[InlineKeyboardButton]:
+            return [
+                InlineKeyboardButton(
+                    element,
+                    callback_data=f"rstrt_srvc:{element}" if configWrap.telegram_ui.is_present_in_require_confirmation("services") else f"rstrt_srv:{element}",
+                )
+            ]
+
+        service_keys: List[List[InlineKeyboardButton]] = list(map(create_service_button, services))
+        await session.reply_text("Services to operate:", reply_markup=InlineKeyboardMarkup(service_keys), silent=notifier.silent_commands)
 
 
 async def services_keyboard(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -895,7 +857,7 @@ async def services_keyboard(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
     if configWrap.telegram_ui.is_present_in_require_confirmation("services") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="List services?", callback_mess="services:")
     else:
-        await services_keyboard_no_confirm(update.effective_message)
+        await services_keyboard_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 async def exec_gcode(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -914,26 +876,23 @@ async def exec_gcode(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("No command provided", quote=True)
 
 
-async def get_macros_no_confirm(effective_message: Message) -> None:
-    await effective_message.get_bot().send_chat_action(chat_id=configWrap.secrets.chat_id, action=ChatAction.TYPING)
-    files_keys: List[List[InlineKeyboardButton]] = list(
-        map(
-            lambda el: [
-                InlineKeyboardButton(
-                    el,
-                    callback_data=(f"macroc:{el}" if configWrap.telegram_ui.is_present_in_require_confirmation(el) or configWrap.telegram_ui.confirm_macro() else f"macro:{el}"),
-                )
-            ],
-            klippy.macros,
+async def get_macros_no_confirm(session: CommandSession) -> None:
+    await session.send_chat_action_typing()
+    if configWrap.bot_config.platform == "matrix":
+        await session.reply_text("Gcode macros (send /MACRO_NAME to run):\n" + "\n".join(klippy.macros), silent=notifier.silent_commands)
+    else:
+        files_keys: List[List[InlineKeyboardButton]] = list(
+            map(
+                lambda el: [
+                    InlineKeyboardButton(
+                        el,
+                        callback_data=(f"macroc:{el}" if configWrap.telegram_ui.is_present_in_require_confirmation(el) or configWrap.telegram_ui.confirm_macro() else f"macro:{el}"),
+                    )
+                ],
+                klippy.macros,
+            )
         )
-    )
-
-    await effective_message.reply_text(
-        "Gcode macros:",
-        reply_markup=InlineKeyboardMarkup(files_keys),
-        disable_notification=notifier.silent_commands,
-        quote=True,
-    )
+        await session.reply_text("Gcode macros:", reply_markup=InlineKeyboardMarkup(files_keys), silent=notifier.silent_commands)
 
 
 async def get_macros(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -944,7 +903,7 @@ async def get_macros(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("macros") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="List macros?", callback_mess="macros:")
     else:
-        await get_macros_no_confirm(update.effective_message)
+        await get_macros_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 async def macros_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1140,18 +1099,13 @@ def bot_commands() -> Dict[str, str]:
     return {c: a for c, a in commands.items() if c not in configWrap.telegram_ui.hidden_bot_commands}
 
 
-async def help_command_no_confirm(effective_message: Message) -> None:
-    ## Fixme: escape symbols???  from telegram.utils.helpers import escape
+async def help_command_no_confirm(session: CommandSession) -> None:
     mess = (
         await klippy.get_versions_info(bot_only=True)
         + ("\n".join([f"/{c} - {a}" for c, a in bot_commands().items()]))
         + '\n\nPlease refer to the <a href="https://github.com/nlef/moonraker-telegram-bot/wiki">wiki</a> for additional information'
     )
-    await effective_message.reply_text(
-        text=mess,
-        parse_mode=ParseMode.HTML,
-        quote=True,
-    )
+    await session.reply_text(mess)
 
 
 async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1162,7 +1116,7 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if configWrap.telegram_ui.is_present_in_require_confirmation("help") or configWrap.telegram_ui.confirm_command():
         await command_confirm_message(update, text="Show help?", callback_mess="help:")
     else:
-        await help_command_no_confirm(update.effective_message)
+        await help_command_no_confirm(TelegramCommandSession(update.effective_message))
 
 
 def prepare_command(marco: str):
@@ -1360,13 +1314,20 @@ if __name__ == "__main__":
         if configWrap.camera.cam_type == "mjpeg"
         else FFmpegCamera(configWrap, klippy, rotating_handler) if configWrap.camera.cam_type == "ffmpeg" else Camera(configWrap, klippy, rotating_handler)
     )
-    bot_updater = start_bot(configWrap.secrets.token, configWrap.bot_config.socks_proxy)
-    timelapse = Timelapse(configWrap, klippy, cameraWrap, a_scheduler, bot_updater.bot, rotating_handler)
-    notifier = Notifier(configWrap, bot_updater.bot, klippy, cameraWrap, a_scheduler, rotating_handler)
 
-    ws_helper = WebSocketHelper(configWrap, klippy, notifier, timelapse, a_scheduler, rotating_handler)
+    if configWrap.bot_config.platform == "matrix":
+        from matrix_bot import run_matrix_bot
 
-    bot_updater.job_queue.run_once(start_scheduler, 1)
-    bot_updater.run_polling(allowed_updates=Update.ALL_TYPES)
+        asyncio.run(run_matrix_bot())
+    else:
+        bot_updater = start_bot(configWrap.secrets.token, configWrap.bot_config.socks_proxy)
+        chat_transport = create_chat_transport(configWrap, bot=bot_updater.bot)
+        timelapse = Timelapse(configWrap, klippy, cameraWrap, a_scheduler, chat_transport, rotating_handler)
+        notifier = Notifier(configWrap, chat_transport, klippy, cameraWrap, a_scheduler, rotating_handler)
+
+        ws_helper = WebSocketHelper(configWrap, klippy, notifier, timelapse, a_scheduler, rotating_handler)
+
+        bot_updater.job_queue.run_once(start_scheduler, 1)
+        bot_updater.run_polling(allowed_updates=Update.ALL_TYPES)
 
     logger.info("Shutting down the bot")

@@ -8,12 +8,10 @@ import re
 from typing import Dict, List, Optional, Tuple, Union
 
 from apscheduler.schedulers.base import BaseScheduler  # type: ignore
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
-from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest
-from telegram.helpers import escape_markdown
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 
 from camera import Camera
+from chat_transport import ChatTransport, MatrixChatTransport, MatrixOutgoingMessage, OutgoingMessage, TelegramOutgoingMessage
 from configuration import ConfigWrapper
 from klippy import Klippy
 
@@ -24,14 +22,13 @@ class Notifier:
     def __init__(
         self,
         config: ConfigWrapper,
-        bot: Bot,
+        transport: ChatTransport,
         klippy: Klippy,
         camera_wrapper: Camera,
         scheduler: BaseScheduler,
         logging_handler: logging.Handler,
     ):
-        self._bot: Bot = bot
-        self._chat_id: int = config.secrets.chat_id
+        self._transport: ChatTransport = transport
         self._cam_wrap: Camera = camera_wrapper
 
         self._sched: BaseScheduler = scheduler
@@ -59,9 +56,9 @@ class Notifier:
         self._last_m117_status: str = ""
         self._last_tgnotify_status: str = ""
 
-        self._status_message: Optional[Message] = None
+        self._status_message: Optional[OutgoingMessage] = None
         self._bzz_mess_id: int = 0
-        self._groups_status_mesages: Dict[int, Message] = {}
+        self._groups_status_mesages: Dict[int, OutgoingMessage] = {}
 
         if logging_handler:
             logger.addHandler(logging_handler)
@@ -127,106 +124,81 @@ class Notifier:
             self._interval = new_value
             self._reschedule_notifier_timer()
 
+    async def _clear_bzz(self) -> None:
+        if self._bzz_mess_id != 0:
+            await self._transport.delete_message_id(self._bzz_mess_id)
+            self._bzz_mess_id = 0
+
+    async def _track_bzz(self, outgoing: OutgoingMessage) -> None:
+        if isinstance(outgoing, TelegramOutgoingMessage):
+            self._bzz_mess_id = outgoing.message_id
+        elif isinstance(outgoing, MatrixOutgoingMessage) and isinstance(self._transport, MatrixChatTransport):
+            self._bzz_mess_id = self._transport.register_bzz_event(outgoing.event_id)
+
     async def _send_message(self, message: str, silent: bool, group_only: bool = False, manual: bool = False) -> None:
         if not group_only:
-            await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
+            await self._transport.send_typing()
             if self._status_message and not manual:
-                if self._bzz_mess_id != 0:
-                    try:
-                        await self._bot.delete_message(self._chat_id, self._bzz_mess_id)
-                    except BadRequest as badreq:
-                        logger.warning("Failed deleting bzz message \n%s", badreq)
-                        self._bzz_mess_id = 0
-
-                if self._status_message.caption:
-                    await self._status_message.edit_caption(caption=message, parse_mode=ParseMode.MARKDOWN_V2)
+                await self._clear_bzz()
+                if self._status_message.has_caption:
+                    await self._status_message.edit_caption(caption=message)
                 else:
-                    await self._status_message.edit_text(text=message, parse_mode=ParseMode.MARKDOWN_V2)
+                    await self._status_message.edit_text(text=message)
 
                 if self._progress_update_message:
-                    mes = await self._bot.send_message(self._chat_id, text="Status has been updated\nThis message will be deleted", disable_notification=silent)
-                    self._bzz_mess_id = mes.message_id
+                    mes = await self._transport.send_text_message("Status has been updated\nThis message will be deleted", silent)
+                    await self._track_bzz(mes)
             else:
-                sent_message = await self._bot.send_message(
-                    self._chat_id,
-                    text=message,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    disable_notification=silent,
-                )
+                sent_message = await self._transport.send_text_message(message, silent)
                 if not self._status_message and not manual:
                     self._status_message = sent_message
 
-        for group, message_thread_id in self._notify_groups:
-            await self._bot.send_chat_action(chat_id=group, message_thread_id=message_thread_id, action=ChatAction.TYPING)
-            if group in self._groups_status_mesages and not manual:
-                mess = self._groups_status_mesages[group]
-                if mess.caption:
-                    await mess.edit_caption(caption=message, parse_mode=ParseMode.MARKDOWN_V2)
+        if self._transport.supports_notify_groups:
+            for group, message_thread_id in self._notify_groups:
+                await self._transport.send_typing_group(group, message_thread_id)
+                if group in self._groups_status_mesages and not manual:
+                    mess = self._groups_status_mesages[group]
+                    if mess.has_caption:
+                        await mess.edit_caption(caption=message)
+                    else:
+                        await mess.edit_text(text=message)
                 else:
-                    await mess.edit_text(text=message, parse_mode=ParseMode.MARKDOWN_V2)
-            else:
-                sent_message = await self._bot.send_message(
-                    chat_id=group,
-                    message_thread_id=message_thread_id,
-                    text=message,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    disable_notification=silent,
-                )
-                if group in self._groups_status_mesages or manual:
-                    continue
-                self._groups_status_mesages[group] = sent_message
+                    sent_message = await self._transport.send_text_group(group, message_thread_id, message, silent)
+                    if group in self._groups_status_mesages or manual:
+                        continue
+                    self._groups_status_mesages[group] = sent_message
 
     async def _send_photo(self, group_only, manual, message, silent):
         loop = asyncio.get_running_loop()
         with await loop.run_in_executor(self._executors_pool, self._cam_wrap.take_photo) as photo:
             if not group_only:
-                await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.UPLOAD_PHOTO)
+                await self._transport.send_upload_photo()
                 if self._status_message and not manual:
-                    if self._bzz_mess_id != 0:
-                        try:
-                            await self._bot.delete_message(self._chat_id, self._bzz_mess_id)
-                        except BadRequest as badreq:
-                            logger.warning("Failed deleting bzz message \n%s", badreq)
-                            self._bzz_mess_id = 0
-
-                    # Fixme: check if media in message!
-                    await self._status_message.edit_media(media=InputMediaPhoto(photo))
-                    await self._status_message.edit_caption(caption=message, parse_mode=ParseMode.MARKDOWN_V2)
+                    await self._clear_bzz()
+                    await self._status_message.edit_media_photo(photo)
+                    await self._status_message.edit_caption(caption=message)
 
                     if self._progress_update_message:
-                        mes = await self._bot.send_message(self._chat_id, text="Status has been updated\nThis message will be deleted", disable_notification=silent)
-                        self._bzz_mess_id = mes.message_id
-
+                        mes = await self._transport.send_text_message("Status has been updated\nThis message will be deleted", silent)
+                        await self._track_bzz(mes)
                 else:
-                    sent_message = await self._bot.send_photo(
-                        self._chat_id,
-                        photo=photo,
-                        caption=message,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        disable_notification=silent,
-                    )
+                    sent_message = await self._transport.send_photo_message(photo, message, silent)
                     if not self._status_message and not manual:
                         self._status_message = sent_message
 
-            for group, message_thread_id in self._notify_groups:
-                photo.seek(0)
-                await self._bot.send_chat_action(chat_id=group, message_thread_id=message_thread_id, action=ChatAction.UPLOAD_PHOTO)
-                if group in self._groups_status_mesages and not manual:
-                    mess = self._groups_status_mesages[group]
-                    await mess.edit_media(media=InputMediaPhoto(photo))
-                    await mess.edit_caption(caption=message, parse_mode=ParseMode.MARKDOWN_V2)
-                else:
-                    sent_message = await self._bot.send_photo(
-                        chat_id=group,
-                        message_thread_id=message_thread_id,
-                        photo=photo,
-                        caption=message,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        disable_notification=silent,
-                    )
-                    if group in self._groups_status_mesages or manual:
-                        continue
-                    self._groups_status_mesages[group] = sent_message
+            if self._transport.supports_notify_groups:
+                for group, message_thread_id in self._notify_groups:
+                    photo.seek(0)
+                    await self._transport.send_upload_photo()
+                    if group in self._groups_status_mesages and not manual:
+                        mess = self._groups_status_mesages[group]
+                        await mess.edit_media_photo(photo)
+                        await mess.edit_caption(caption=message)
+                    else:
+                        sent_message = await self._transport.send_photo_group(group, message_thread_id, photo, message, silent)
+                        if group in self._groups_status_mesages or manual:
+                            continue
+                        self._groups_status_mesages[group] = sent_message
 
             photo.close()
 
@@ -249,7 +221,7 @@ class Notifier:
         self._sched.add_job(
             self._send_message,
             kwargs={
-                "message": escape_markdown(message, version=2),
+                "message": self._transport.escape_progress(message),
                 "silent": False,
                 "manual": True,
             },
@@ -263,7 +235,7 @@ class Notifier:
         self._sched.add_job(
             self._notify,
             kwargs={
-                "message": escape_markdown(message, version=2),
+                "message": self._transport.escape_progress(message),
                 "silent": False,
                 "manual": True,
             },
@@ -277,7 +249,7 @@ class Notifier:
         self._sched.add_job(
             self._send_message,
             kwargs={
-                "message": escape_markdown(message, version=2),
+                "message": self._transport.escape_progress(message),
                 "silent": self._silent_status,
                 "manual": True,
             },
@@ -291,7 +263,7 @@ class Notifier:
         self._sched.add_job(
             self._send_message,
             kwargs={
-                "message": escape_markdown(message, version=2),
+                "message": self._transport.escape_progress(message),
                 "silent": self._silent_commands,
                 "manual": True,
             },
@@ -305,7 +277,7 @@ class Notifier:
         self._sched.add_job(
             self._notify,
             kwargs={
-                "message": escape_markdown(message, version=2),
+                "message": self._transport.escape_progress(message),
                 "silent": self._silent_commands,
                 "manual": True,
             },
@@ -323,20 +295,15 @@ class Notifier:
         self._last_tgnotify_status = ""
         self._status_message = None
         self._groups_status_mesages = {}
-        if self._bzz_mess_id != 0:
-            try:
-                await self._bot.delete_message(self._chat_id, self._bzz_mess_id)
-            except BadRequest as badreq:
-                logger.warning("Failed deleting bzz message \n%s", badreq)
-            finally:
-                self._bzz_mess_id = 0
+        await self._clear_bzz()
 
     def _schedule_notification(self, message: str = "", schedule: bool = False, finish: bool = False) -> None:  # pylint: disable=W0613
-        mess = escape_markdown(self._klippy.get_print_stats(message), version=2)
+        esc = self._transport.escape_progress
+        mess = esc(self._klippy.get_print_stats(message))
         if self._last_m117_status and "m117_status" in self._message_parts:
-            mess += f"{escape_markdown(self._last_m117_status, version=2)}\n"
+            mess += f"{esc(self._last_m117_status)}\n"
         if self._last_tgnotify_status and "tgnotify_status" in self._message_parts:
-            mess += f"{escape_markdown(self._last_tgnotify_status, version=2)}\n"
+            mess += f"{esc(self._last_tgnotify_status)}\n"
         if "last_update_time" in self._message_parts:
             mess += f"_Last update at {datetime.now():%H:%M:%S}_"
 
@@ -424,31 +391,22 @@ class Notifier:
     async def _send_print_start_info(self) -> None:
         message, bio = await self._klippy.get_file_info("Printer started printing")
         if bio is not None:
-            status_message = await self._bot.send_photo(
-                self._chat_id,
-                photo=bio,
-                caption=message,
-                disable_notification=self.silent_status,
-            )
-            for group_, message_thread_id in self._notify_groups:
-                bio.seek(0)
-                self._groups_status_mesages[group_] = await self._bot.send_photo(
-                    chat_id=group_,
-                    message_thread_id=message_thread_id,
-                    photo=bio,
-                    caption=message,
-                    disable_notification=self.silent_status,
-                )
+            status_message = await self._transport.send_photo_message(bio, message, self.silent_status)
+            if self._transport.supports_notify_groups:
+                for group_, message_thread_id in self._notify_groups:
+                    bio.seek(0)
+                    self._groups_status_mesages[group_] = await self._transport.send_photo_group(group_, message_thread_id, bio, message, self.silent_status)
             bio.close()
         else:
-            status_message = await self._bot.send_message(chat_id=self._chat_id, text=message, disable_notification=self.silent_status)
-            for group_, message_thread_id in self._notify_groups:
-                self._groups_status_mesages[group_] = await self._bot.send_message(chat_id=group_, message_thread_id=message_thread_id, text=message, disable_notification=self.silent_status)
+            status_message = await self._transport.send_text_message(message, self.silent_status)
+            if self._transport.supports_notify_groups:
+                for group_, message_thread_id in self._notify_groups:
+                    self._groups_status_mesages[group_] = await self._transport.send_text_group(group_, message_thread_id, message, self.silent_status)
         self._status_message = status_message
 
         if self._pin_status_single_message:
-            await self._bot.unpin_all_chat_messages(self._chat_id)
-            await self._bot.pin_chat_message(self._chat_id, status_message.message_id, disable_notification=self.silent_status)
+            await self._transport.unpin_all()
+            await self._transport.pin_status(status_message)
 
     def send_print_start_info(self) -> None:
         if self._enabled:
@@ -505,7 +463,7 @@ class Notifier:
             for path in paths:
                 path_obj = Path(path)
                 if not path_obj.is_file():
-                    await self._bot.send_message(self._chat_id, text="Provided path is not a file", disable_notification=self._silent_commands)
+                    await self._transport.send_text_message("Provided path is not a file", self._silent_commands)
                     return
 
                 bio = BytesIO()
@@ -515,7 +473,7 @@ class Notifier:
                     bio.write(fh.read())
                 bio.seek(0)
                 if bio.getbuffer().nbytes > 10485760:
-                    await self._bot.send_message(self._chat_id, text=f"Telegram bots have a 10mb filesize restriction for images, image couldn't be uploaded: `{path}`")
+                    await self._transport.send_text_message(f"Image exceeds 10mb upload limit, couldn't upload: `{path}`", self._silent_commands)
                 else:
                     if not photos_list:
                         photos_list.append(InputMediaPhoto(bio, filename=bio.name, caption=message))
@@ -523,15 +481,11 @@ class Notifier:
                         photos_list.append(InputMediaPhoto(bio, filename=bio.name))
                 bio.close()
 
-            await self._bot.send_media_group(
-                self._chat_id,
-                media=photos_list,
-                disable_notification=self._silent_commands,
-            )
+            await self._transport.send_media_group(photos_list, self._silent_commands)
 
         except Exception as ex:
             logger.warning(ex)
-            await self._bot.send_message(self._chat_id, text=f"Error sending image: {ex}", disable_notification=self._silent_commands)
+            await self._transport.send_text_message(f"Error sending image: {ex}", self._silent_commands)
 
     def send_image(self, ws_message: str) -> None:
         self._sched.add_job(
@@ -549,7 +503,7 @@ class Notifier:
             for path in paths:
                 path_obj = Path(path)
                 if not path_obj.is_file():
-                    await self._bot.send_message(self._chat_id, text="Provided path is not a file", disable_notification=self._silent_commands)
+                    await self._transport.send_text_message("Provided path is not a file", self._silent_commands)
                     return
 
                 bio = BytesIO()
@@ -559,7 +513,7 @@ class Notifier:
                     bio.write(fh.read())
                 bio.seek(0)
                 if bio.getbuffer().nbytes > self._max_upload_file_size * 1024 * 1024:
-                    await self._bot.send_message(self._chat_id, text=f"Telegram bots have a {self._max_upload_file_size}mb filesize restriction, video couldn't be uploaded: `{path}`")
+                    await self._transport.send_text_message(f"Video exceeds {self._max_upload_file_size}mb upload limit, couldn't upload: `{path}`", self._silent_commands)
                 else:
                     if not photos_list:
                         photos_list.append(InputMediaVideo(bio, filename=bio.name, caption=message))
@@ -567,16 +521,11 @@ class Notifier:
                         photos_list.append(InputMediaVideo(bio, filename=bio.name))
                 bio.close()
 
-            await self._bot.send_media_group(
-                self._chat_id,
-                media=photos_list,
-                disable_notification=self._silent_commands,
-                write_timeout=120,
-            )
+            await self._transport.send_media_group(photos_list, self._silent_commands, write_timeout=120)
 
         except Exception as ex:
             logger.warning(ex)
-            await self._bot.send_message(self._chat_id, text=f"Error sending video: {ex}", disable_notification=self._silent_commands)
+            await self._transport.send_text_message(f"Error sending video: {ex}", self._silent_commands)
 
     def send_video(self, ws_message: str) -> None:
         self._sched.add_job(
@@ -594,7 +543,7 @@ class Notifier:
             for path in paths:
                 path_obj = Path(path)
                 if not path_obj.is_file():
-                    await self._bot.send_message(self._chat_id, text="Provided path is not a file", disable_notification=self._silent_commands)
+                    await self._transport.send_text_message("Provided path is not a file", self._silent_commands)
                     return
 
                 bio = BytesIO()
@@ -604,7 +553,7 @@ class Notifier:
                     bio.write(fh.read())
                 bio.seek(0)
                 if bio.getbuffer().nbytes > self._max_upload_file_size * 1024 * 1024:
-                    await self._bot.send_message(self._chat_id, text=f"Telegram bots have a {self._max_upload_file_size}mb filesize restriction, document couldn't be uploaded: `{path}`")
+                    await self._transport.send_text_message(f"Document exceeds {self._max_upload_file_size}mb upload limit, couldn't upload: `{path}`", self._silent_commands)
                 else:
                     if not photos_list:
                         photos_list.append(InputMediaDocument(bio, filename=bio.name, caption=message))
@@ -612,15 +561,11 @@ class Notifier:
                         photos_list.append(InputMediaDocument(bio, filename=bio.name))
                 bio.close()
 
-            await self._bot.send_media_group(
-                self._chat_id,
-                media=photos_list,
-                disable_notification=self._silent_commands,
-            )
+            await self._transport.send_media_group(photos_list, self._silent_commands)
 
         except Exception as ex:
             logger.warning(ex)
-            await self._bot.send_message(self._chat_id, text=f"Error sending document: {ex}", disable_notification=self._silent_commands)
+            await self._transport.send_text_message(f"Error sending document: {ex}", self._silent_commands)
 
     def send_document(self, ws_message: str) -> None:
         self._sched.add_job(
@@ -688,9 +633,4 @@ class Notifier:
         else:
             title = ""
 
-        await self._bot.send_message(
-            self._chat_id,
-            text=title,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            disable_notification=self._silent_commands,
-        )
+        await self._transport.send_message_with_keyboard(title, InlineKeyboardMarkup(keyboard), self._silent_commands)

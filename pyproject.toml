@@ -42,8 +42,11 @@ combine_as_imports = true
 line_length = 200
 known_first_party = [
     "camera",
+    "chat_transport",
+    "command_session",
     "configuration",
     "klippy",
+    "matrix_bot",
     "notifications",
     "timelapse",
     "websocket_helper"

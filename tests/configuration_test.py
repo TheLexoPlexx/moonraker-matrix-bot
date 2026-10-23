@@ -8,6 +8,8 @@ CONFIG_PATH = "tests/resources/telegram.conf"
 CONFIG_MINIMAL_PATH = "tests/resources/telegram_minimal.conf"
 CONFIG_TEMPLATE_PATH = "scripts/base_install_template"
 CONFIG_WITH_SECRETS_PATH = "tests/resources/telegram_secrets.conf"
+CONFIG_MATRIX_PATH = "tests/resources/matrix.conf"
+CONFIG_MATRIX_INVALID_PATH = "tests/resources/matrix_invalid.conf"
 
 
 def test_template_config_has_no_errors():
@@ -46,3 +48,20 @@ def test_config_has_no_errors(config_helper):
 
 def test_config_bot_is_valid(config_helper):
     assert config_helper.secrets.chat_id == 16612341234 and config_helper.secrets.token == "23423423334:sdfgsdfg-dfgdfgsdfg"
+
+
+def test_matrix_config_has_no_errors():
+    config_path = pathlib.Path(CONFIG_MATRIX_PATH).absolute().as_posix()
+    config = ConfigWrapper(config_path)
+    assert config.configuration_errors == ""
+    assert config.bot_config.platform == "matrix"
+    assert config.secrets.matrix_token == "syt_matrix_access_token"
+    assert config.bot_config.homeserver == "https://matrix.example.org"
+
+
+def test_matrix_config_invalid_without_credentials():
+    config_path = pathlib.Path(CONFIG_MATRIX_INVALID_PATH).absolute().as_posix()
+    config = ConfigWrapper(config_path)
+    assert config.parsing_errors != ""
+    assert "matrix_token" in config.parsing_errors
+    assert "homeserver" in config.parsing_errors
