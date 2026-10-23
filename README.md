@@ -1,3 +1,10 @@
+# DO NOT USE THIS
+
+Like, for real. I gave Grok one prompt and din't even bother to test it myself yet.
+
+-----
+
+
 # moonraker-telegram-bot
 
 ![image](https://user-images.githubusercontent.com/51682059/140623765-3b839b4b-40c2-4f87-8969-6cb609f2c5f1.png)
